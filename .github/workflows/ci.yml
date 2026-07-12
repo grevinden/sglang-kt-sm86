@@ -178,6 +178,9 @@ jobs:
               MEM_TRACKER_PID=$!
 
               # Build with maximum verbosity
+              # NOTE: set +e to capture pip exit code — under set -e a failed
+              # pipeline kills the script before the error handler can run.
+              set +e
               TORCH_CUDA_ARCH_LIST="8.6" \
               SKBUILD_CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1;-DSGL_KERNEL_ENABLE_FA3=OFF" \
               MAX_JOBS=1 \
@@ -189,9 +192,11 @@ jobs:
                 --no-cache-dir \
                 --no-build-isolation \
                 --progress-bar on \
+                -d /workspace/wheels \
                 . 2>&1 | tee /workspace/sgl-kernel-build.log
 
               PIP_EXIT_CODE=$?
+              set -e
               kill $MEM_TRACKER_PID 2>/dev/null || true
 
               swapoff /swapfile || true
