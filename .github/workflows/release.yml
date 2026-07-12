@@ -45,7 +45,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: wheels/sgl_kernel-*.whl
-          key: sgl-kernel-${{ hashFiles('patches/**') }}
+          key: sgl-kernel-${{ hashFiles('patches/**') }}-${{ secrets.CACHE_VERSION || '1' }}
 
       - name: Check existing wheel
         id: check-wheel
@@ -116,6 +116,7 @@ jobs:
                 --no-cache-dir \
                 --no-build-isolation \
                 --progress-bar on \
+                -d /workspace/wheels \
                 . 2>&1 | tee /workspace/sgl-kernel-build.log
 
               EXIT_CODE=$?

@@ -189,6 +189,7 @@ jobs:
                 --no-cache-dir \
                 --no-build-isolation \
                 --progress-bar on \
+                -d /workspace/wheels \
                 . 2>&1 | tee /workspace/sgl-kernel-build.log
 
               PIP_EXIT_CODE=$?
