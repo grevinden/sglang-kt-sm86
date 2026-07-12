@@ -1,0 +1,23 @@
+# Wheels — CI собирает sgl_kernel сам
+wheels/sgl_kernel-*.whl
+
+# IDE
+.zed/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.log
+memory-trace.log
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/

@@ -1,0 +1,15 @@
+--- a/sgl_kernel/load_utils.py
++++ b/sgl_kernel/load_utils.py
+@@ -83,9 +83,12 @@
+ 
+     # Determine which version to load based on GPU architecture
+     if compute_capability == 90:
+         ops_subdir = "sm90"
+         variant_name = "SM90 (Hopper/H100 with fast math optimization)"
++    elif compute_capability < 90:
++        ops_subdir = "sm90"
++        variant_name = f"SM{compute_capability} (SM90 fast-math fallback)"
+     elif compute_capability is not None:
+         ops_subdir = "sm100"
+         variant_name = f"SM{compute_capability} (precise math for compatibility)"
+     else:

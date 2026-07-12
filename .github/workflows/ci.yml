@@ -1,0 +1,333 @@
+# =============================================================================
+# CI — сборка sglang-kt Docker-образа в GitHub Actions
+#
+# Стратегия борьбы с OOM при компиляции FA2:
+#   1. MAX_JOBS=1, COMPILE_THREADS=1 — минимизируем параллелизм
+#   2. Создаём swap-файл внутри контейнера перед компиляцией
+#   3. Кешируем собранный wheel, чтобы пересобирать только при изменении
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  BASE_IMAGE: lmsysorg/sglang:v0.5.15-cu129
+
+jobs:
+  ###########################################################################
+  # Сборка sgl-kernel wheel (CUDA kernel ops — FA2, flashmla, и т.д.)
+  ###########################################################################
+  build-sgl-kernel:
+    runs-on: ubuntu-latest
+    outputs:
+      wheel-exists: ${{ steps.check-wheel.outputs.exists }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # Диагностика раннера
+      # ------------------------------------------------------------------
+      - name: Runner diagnostics
+        run: |
+          echo "=== HOSTNAME ==="
+          hostname
+          echo "=== CPU ==="
+          nproc
+          lscpu | grep -E '^(CPU\(s\)|Thread|Core|Socket|Model name)'
+          echo "=== MEMORY ==="
+          free -h
+          cat /proc/meminfo | head -20
+          echo "=== DISK ==="
+          df -h /
+          echo "=== DOCKER ==="
+          docker info 2>&1 | grep -E '(Memory|Swap|CPU|Storage)'
+          echo "=== KERNEL ==="
+          uname -a
+
+      # ------------------------------------------------------------------
+      # Проверяем кеш на уже собранный wheel
+      # ------------------------------------------------------------------
+      - name: Restore cached kernel wheel
+        id: cache-wheel
+        uses: actions/cache@v4
+        with:
+          path: wheels/sgl_kernel-*.whl
+          key: sgl-kernel-${{ hashFiles('patches/**') }}-${{ secrets.CACHE_VERSION || '1' }}
+
+      - name: Check existing wheel
+        id: check-wheel
+        run: |
+          echo "=== Cache check ==="
+          echo "Cache hit: ${{ steps.cache-wheel.outputs.cache-hit }}"
+          if ls wheels/sgl_kernel-*.whl 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            ls -lh wheels/sgl_kernel-*.whl
+            echo "Wheel found in cache/repo: $(ls wheels/sgl_kernel-*.whl)"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "No wheel found — will build from source"
+          fi
+
+      # ------------------------------------------------------------------
+      # Сборка sgl-kernel wheel
+      # ------------------------------------------------------------------
+      - name: Build sgl-kernel wheel
+        if: steps.check-wheel.outputs.exists == 'false'
+        run: |
+          echo "=== Starting sgl-kernel build ==="
+          echo "Runner memory before:"
+          free -h
+
+          docker run --rm \
+            --memory=6g --memory-swap=12g \
+            -v "$PWD":/workspace \
+            -w /workspace \
+            "${{ env.BASE_IMAGE }}" \
+            bash -c '
+              set -eux -o pipefail
+
+              echo "=============================================="
+              echo "  CONTAINER: system info"
+              echo "=============================================="
+              echo "Date: $(date -u)"
+              echo "Host: $(hostname)"
+              echo "CPU: $(nproc)"
+              free -h
+              df -h
+              cat /proc/meminfo | head -10
+              nvidia-smi 2>/dev/null || echo "nvidia-smi: not available (no GPU in CI runner)"
+
+              echo ""
+              echo "=============================================="
+              echo "  CONTAINER: Python env"
+              echo "=============================================="
+              python3 --version
+              pip --version
+              python3 -c "import torch; print(f\"torch {torch.__version__}, CUDA {torch.version.cuda}\")"
+              python3 -c "import torch; print(f\"torch includes: sgl_kernel deps={hasattr(torch, \\\"ops\\\")}\")"
+
+              echo ""
+              echo "=============================================="
+              echo "  Creating swap file (OOM protection)"
+              echo "=============================================="
+              fallocate -l 8G /swapfile && chmod 600 /swapfile
+              mkswap /swapfile && swapon /swapfile
+              swapon --show
+              free -h
+
+              echo ""
+              echo "=============================================="
+              echo "  Installing build dependencies"
+              echo "=============================================="
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends \
+                cmake build-essential git time
+              echo "cmake: $(cmake --version 2>&1 | head -1)"
+              echo "gcc: $(gcc --version 2>&1 | head -1)"
+              echo "make: $(make --version 2>&1 | head -1)"
+
+              echo ""
+              echo "=============================================="
+              echo "  Cloning sglang repo"
+              echo "=============================================="
+              GIT_TRACE=1 GIT_CURL_VERBOSE=1 \
+              git clone --depth 1 --progress --verbose \
+                https://github.com/sgl-project/sglang.git /tmp/sglang 2>&1
+              echo "Clone OK. Commit:"
+              git -C /tmp/sglang log --oneline -1
+
+              echo ""
+              echo "=============================================="
+              echo "  Building sgl-kernel wheel"
+              echo "=============================================="
+              echo "  MAX_JOBS=1"
+              echo "  COMPILE_THREADS=1"
+              echo "  TORCH_CUDA_ARCH_LIST=8.6"
+              echo "  FA3=OFF"
+              echo "=============================================="
+              echo ""
+
+              cd /tmp/sglang/sgl-kernel
+              echo "--- sgl-kernel sources ---"
+              ls -la
+              echo "--- pyproject.toml ---"
+              cat pyproject.toml 2>/dev/null || echo "no pyproject.toml"
+              echo ""
+              echo "--- Setup / build files ---"
+              find . -maxdepth 2 -name "*.py" -o -name "CMakeLists.txt" -o -name "*.cmake" | head -20
+
+              echo ""
+              echo "=== Starting pip wheel ==="
+              echo ""
+
+              # Memory tracking during build
+              (
+                while true; do
+                  free -h | grep "^Mem:" >> /workspace/memory-trace.log 2>/dev/null || true
+                  sleep 30
+                done
+              ) &
+              MEM_TRACKER_PID=$!
+
+              # Build with maximum verbosity
+              TORCH_CUDA_ARCH_LIST="8.6" \
+              SKBUILD_CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1;-DSGL_KERNEL_ENABLE_FA3=OFF" \
+              MAX_JOBS=1 \
+              CMAKE_VERBOSE_MAKEFILE=ON \
+              CMAKE_BUILD_PARALLEL_LEVEL=1 \
+              VERBOSE=1 \
+              pip wheel \
+                -vvv \
+                --no-cache-dir \
+                --no-build-isolation \
+                --progress-bar on \
+                . 2>&1 | tee /workspace/sgl-kernel-build.log
+
+              PIP_EXIT_CODE=$?
+              kill $MEM_TRACKER_PID 2>/dev/null || true
+
+              swapoff /swapfile || true
+
+              echo ""
+              echo "=== pip wheel exit code: $PIP_EXIT_CODE ==="
+              echo ""
+
+              if [ $PIP_EXIT_CODE -ne 0 ]; then
+                echo "=============================================="
+                echo "  BUILD FAILED"
+                echo "=============================================="
+                echo "Last 200 lines of build log:"
+                tail -200 /workspace/sgl-kernel-build.log
+                echo ""
+                echo "Memory trace:"
+                cat /workspace/memory-trace.log 2>/dev/null || echo "(no memory trace)"
+                exit $PIP_EXIT_CODE
+              fi
+
+              echo "=============================================="
+              echo "  BUILD SUCCESS"
+              echo "=============================================="
+              echo "Built wheel:"
+              ls -lh /workspace/wheels/sgl_kernel-*.whl
+              echo ""
+              echo "Build log lines: $(wc -l /workspace/sgl-kernel-build.log)"
+              echo ""
+              echo "Memory trace:"
+              cat /workspace/memory-trace.log 2>/dev/null || echo "(no memory trace)"
+            '
+
+      # ------------------------------------------------------------------
+      # Проверка результатов
+      # ------------------------------------------------------------------
+      - name: List built wheels
+        run: |
+          echo "=== Wheels directory ==="
+          ls -lh wheels/ 2>/dev/null || echo "(empty)"
+          echo "=== Build log ==="
+          if [ -f sgl-kernel-build.log ]; then
+            echo "Log size: $(wc -l sgl-kernel-build.log) lines, $(du -h sgl-kernel-build.log | cut -f1)"
+          else
+            echo "No build log found"
+          fi
+          echo "=== Memory trace ==="
+          if [ -f memory-trace.log ]; then
+            cat memory-trace.log
+          else
+            echo "No memory trace"
+          fi
+
+      - name: Upload sgl-kernel wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: sgl-kernel-wheel
+          path: wheels/sgl_kernel-*.whl
+          if-no-files-found: warn
+          compression-level: 0
+
+      - name: Upload build log
+        uses: actions/upload-artifact@v4
+        with:
+          name: sgl-kernel-build-log
+          path: |
+            sgl-kernel-build.log
+            memory-trace.log
+          if-no-files-found: warn
+          compression-level: 0
+
+
+  ###########################################################################
+  # Сборка финального Docker-образа
+  ###########################################################################
+  build-docker:
+    needs: [build-sgl-kernel]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download sgl-kernel wheel
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          name: sgl-kernel-wheel
+        continue-on-error: true
+
+      - name: Verify build context
+        run: |
+          echo "=== Build context ==="
+          echo "wheels/:"
+          ls -lh wheels/ 2>/dev/null || echo "(empty — using repo wheels)"
+          echo "patches/:"
+          ls -lh patches/
+          echo "Dockerfile:"
+          head -5 Dockerfile
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=,suffix=,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            MAX_JOBS=1
+            COMPILE_THREADS=1
+            PIP_VERBOSE=-vvv
+          provenance: false
+
+      - name: Image diagnostics
+        run: |
+          echo "=== Built image ==="
+          docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | grep sglang

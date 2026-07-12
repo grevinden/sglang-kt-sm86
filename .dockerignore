@@ -1,0 +1,28 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.zed
+.idea
+.vscode
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CI
+.github
+
+# Build artifacts
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+**/*.egg-info
+
+# Локальные файлы, не нужные при сборке
+*.md
+*.log

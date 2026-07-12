@@ -1,0 +1,181 @@
+# =============================================================================
+# Ручной запуск: пересобрать sgl-kernel wheel из upstream
+#
+# gh workflow run build-kernel.yml
+#   или через UI: Actions → Rebuild sgl-kernel → Run workflow
+# =============================================================================
+
+name: Rebuild sgl-kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      cuda_arch:
+        description: 'CUDA architecture'
+        required: true
+        default: '8.6'
+        type: choice
+        options:
+          - '7.5'   # Turing   (RTX 20xx)
+          - '8.0'   # Ampere   (A100)
+          - '8.6'   # Ampere   (RTX 30xx/40xx)
+          - '8.9'   # Ada      (RTX 4090)
+          - '9.0'   # Hopper   (H100)
+      max_jobs:
+        description: 'Parallel build jobs'
+        required: true
+        default: '1'
+        type: choice
+        options: ['1', '2', '4']
+      enable_fa3:
+        description: 'Enable Flash Attention 3'
+        required: true
+        default: 'OFF'
+        type: choice
+        options: ['OFF', 'ON']
+
+env:
+  BASE_IMAGE: lmsysorg/sglang:v0.5.15-cu129
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner diagnostics
+        run: |
+          echo "=== Runner ==="
+          hostname
+          echo "CPU: $(nproc)"
+          free -h
+          df -h /
+          echo "Inputs: arch=${{ inputs.cuda_arch }}, jobs=${{ inputs.max_jobs }}, fa3=${{ inputs.enable_fa3 }}"
+
+      - name: Build sgl-kernel wheel
+        run: |
+          docker run --rm \
+            --memory=8g --memory-swap=16g \
+            -v "$PWD":/workspace \
+            -w /workspace \
+            "${{ env.BASE_IMAGE }}" \
+            bash -c '
+              set -eux -o pipefail
+
+              echo "=============================================="
+              echo "  BUILD SGL-KERNEL WHEEL"
+              echo "=============================================="
+              date -u
+              nproc
+              free -h
+              cat /proc/meminfo | head -15
+              df -h
+              python3 --version
+              pip --version
+              python3 -c "import torch; print(f\"torch {torch.__version__}, CUDA {torch.version.cuda}\")"
+
+              echo ""
+              echo "===== SWAP ====="
+              fallocate -l 8G /swapfile && chmod 600 /swapfile
+              mkswap /swapfile && swapon /swapfile
+              swapon --show
+              free -h
+
+              echo ""
+              echo "===== INSTALL DEPS ====="
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends \
+                cmake build-essential git time
+
+              echo ""
+              echo "===== CLONE SGLANG ====="
+              GIT_TRACE=1 GIT_CURL_VERBOSE=1 \
+              git clone --depth 1 --progress --verbose \
+                https://github.com/sgl-project/sglang.git /tmp/sglang
+              git -C /tmp/sglang log --oneline -1
+
+              echo ""
+              echo "===== BUILD ====="
+              cd /tmp/sglang/sgl-kernel
+              echo "Sources:"
+              ls -la
+              echo ""
+              echo "pyproject.toml:"
+              cat pyproject.toml 2>/dev/null || true
+
+              # Background memory tracker
+              (
+                while true; do
+                  free -h | grep "^Mem:" >> /workspace/memory-trace.log 2>/dev/null || true
+                  sleep 15
+                done
+              ) &
+              MEM_PID=$!
+
+              TORCH_CUDA_ARCH_LIST="${{ inputs.cuda_arch || '8.6' }}" \
+              SKBUILD_CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1;-DSGL_KERNEL_ENABLE_FA3=${{ inputs.enable_fa3 || 'OFF' }}" \
+              MAX_JOBS=${{ inputs.max_jobs || '1' }} \
+              CMAKE_VERBOSE_MAKEFILE=ON \
+              CMAKE_BUILD_PARALLEL_LEVEL=1 \
+              VERBOSE=1 \
+              pip wheel \
+                -vvv \
+                --no-cache-dir \
+                --no-build-isolation \
+                --progress-bar on \
+                . 2>&1 | tee /workspace/sgl-kernel-build.log
+
+              EXIT_CODE=$?
+              kill $MEM_PID 2>/dev/null || true
+              swapoff /swapfile || true
+
+              echo ""
+              echo "===== RESULT ====="
+              echo "Exit code: $EXIT_CODE"
+              echo ""
+
+              if [ $EXIT_CODE -ne 0 ]; then
+                echo "BUILD FAILED — last 300 lines:"
+                tail -300 /workspace/sgl-kernel-build.log
+                echo ""
+                echo "Memory trace:"
+                cat /workspace/memory-trace.log 2>/dev/null || true
+                exit $EXIT_CODE
+              fi
+
+              echo "BUILD SUCCESS"
+              ls -lh /workspace/wheels/sgl_kernel-*.whl
+              echo "Log: $(wc -l /workspace/sgl-kernel-build.log) lines"
+            '
+
+      - name: List results
+        run: |
+          echo "=== Built wheels ==="
+          ls -lh wheels/
+          echo ""
+          echo "=== Build log ==="
+          if [ -f sgl-kernel-build.log ]; then
+            echo "Lines: $(wc -l < sgl-kernel-build.log)"
+            echo "Size: $(du -h sgl-kernel-build.log | cut -f1)"
+            echo ""
+            echo "Last 50 lines:"
+            tail -50 sgl-kernel-build.log
+          fi
+          echo ""
+          echo "=== Memory trace ==="
+          cat memory-trace.log 2>/dev/null || echo "(none)"
+          echo ""
+          echo "=== Patch version ==="
+          cat patches/load_utils_sm86.patch
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sgl-kernel-sm${{ inputs.cuda_arch || '86' }}
+          path: |
+            wheels/sgl_kernel-*.whl
+            sgl-kernel-build.log
+            memory-trace.log
+          retention-days: 30
+          compression-level: 0

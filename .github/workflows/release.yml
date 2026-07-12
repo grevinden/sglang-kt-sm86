@@ -1,0 +1,264 @@
+# =============================================================================
+# Release — публикация sglang-kt в GHCR по тегам v*
+# =============================================================================
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag'
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  BASE_IMAGE: lmsysorg/sglang:v0.5.15-cu129
+
+jobs:
+  ###########################################################################
+  # Сборка sgl-kernel wheel
+  ###########################################################################
+  build-sgl-kernel:
+    runs-on: ubuntu-latest
+    outputs:
+      wheel-exists: ${{ steps.check-wheel.outputs.exists }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner diagnostics
+        run: |
+          echo "=== CI Runner ==="
+          hostname
+          echo "CPU: $(nproc)"
+          free -h
+          df -h /
+          cat /proc/meminfo | head -10
+          docker info 2>&1 | grep -E '(Memory|Swap|CPU)'
+
+      - name: Restore cached kernel wheel
+        id: cache-wheel
+        uses: actions/cache@v4
+        with:
+          path: wheels/sgl_kernel-*.whl
+          key: sgl-kernel-${{ hashFiles('patches/**') }}
+
+      - name: Check existing wheel
+        id: check-wheel
+        run: |
+          echo "Cache hit: ${{ steps.cache-wheel.outputs.cache-hit }}"
+          if ls wheels/sgl_kernel-*.whl 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            ls -lh wheels/sgl_kernel-*.whl
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "No cached wheel, will build"
+          fi
+
+      - name: Build sgl-kernel wheel
+        if: steps.check-wheel.outputs.exists == 'false'
+        run: |
+          docker run --rm \
+            --memory=8g --memory-swap=16g \
+            -v "$PWD":/workspace \
+            -w /workspace \
+            "${{ env.BASE_IMAGE }}" \
+            bash -c '
+              set -eux -o pipefail
+
+              echo "===== CONTAINER DIAGNOSTICS ====="
+              date -u
+              nproc
+              free -h
+              cat /proc/meminfo | head -10
+              df -h
+              python3 -c "import torch; print(f\"torch {torch.__version__}, CUDA {torch.version.cuda}\")"
+
+              echo "===== SWAP SETUP ====="
+              fallocate -l 8G /swapfile && chmod 600 /swapfile
+              mkswap /swapfile && swapon /swapfile
+              swapon --show
+              free -h
+
+              echo "===== INSTALL BUILD DEPS ====="
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends \
+                cmake build-essential git time
+
+              echo "===== CLONE SGLANG ====="
+              GIT_TRACE=1 GIT_CURL_VERBOSE=1 \
+              git clone --depth 1 --progress --verbose \
+                https://github.com/sgl-project/sglang.git /tmp/sglang
+
+              echo "===== BUILD SGL-KERNEL ====="
+              cd /tmp/sglang/sgl-kernel
+
+              (
+                while true; do
+                  free -h | grep "^Mem:" >> /workspace/memory-trace.log 2>/dev/null || true
+                  sleep 30
+                done
+              ) &
+              MEM_PID=$!
+
+              TORCH_CUDA_ARCH_LIST="8.6" \
+              SKBUILD_CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1;-DSGL_KERNEL_ENABLE_FA3=OFF" \
+              MAX_JOBS=1 \
+              CMAKE_VERBOSE_MAKEFILE=ON \
+              CMAKE_BUILD_PARALLEL_LEVEL=1 \
+              VERBOSE=1 \
+              pip wheel \
+                -vvv \
+                --no-cache-dir \
+                --no-build-isolation \
+                --progress-bar on \
+                . 2>&1 | tee /workspace/sgl-kernel-build.log
+
+              EXIT_CODE=$?
+              kill $MEM_PID 2>/dev/null || true
+              swapoff /swapfile || true
+
+              if [ $EXIT_CODE -ne 0 ]; then
+                echo "===== BUILD FAILED ====="
+                tail -300 /workspace/sgl-kernel-build.log
+                echo "===== MEMORY TRACE ====="
+                cat /workspace/memory-trace.log 2>/dev/null
+                exit $EXIT_CODE
+              fi
+
+              echo "===== BUILD SUCCESS ====="
+              ls -lh /workspace/wheels/sgl_kernel-*.whl
+              echo "Build log: $(wc -l /workspace/sgl-kernel-build.log) lines"
+            '
+
+      - name: Upload sgl-kernel wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: sgl-kernel-wheel
+          path: wheels/sgl_kernel-*.whl
+          retention-days: 90
+          compression-level: 0
+
+      - name: Upload build log
+        uses: actions/upload-artifact@v4
+        with:
+          name: sgl-kernel-build-log
+          path: |
+            sgl-kernel-build.log
+            memory-trace.log
+          retention-days: 90
+          compression-level: 0
+
+
+  ###########################################################################
+  # Публикация Docker-образа и GitHub Release
+  ###########################################################################
+  release:
+    needs: [build-sgl-kernel]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download sgl-kernel wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: sgl-kernel-wheel
+        continue-on-error: true
+
+      - name: Verify build context
+        run: |
+          echo "=== Build context ==="
+          ls -lh wheels/
+          ls -lh patches/
+          echo "=== Dockerfile ==="
+          head -10 Dockerfile
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Parse version
+        id: version
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+            type=sha,prefix=,format=short
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            MAX_JOBS=1
+            COMPILE_THREADS=1
+            PIP_VERBOSE=-vvv
+
+      - name: Generate release notes
+        run: |
+          BUILD_LOG_SIZE="?"
+          if [ -f sgl-kernel-build.log ]; then
+            BUILD_LOG_SIZE="$(wc -l < sgl-kernel-build.log) lines"
+          fi
+          cat > /tmp/release-notes.md << EOF
+          ## sglang-kt ${{ steps.version.outputs.version }}
+
+          **Base image:** \`${{ env.BASE_IMAGE }}\`
+          **GPU arch:** SM86 (TORCH_CUDA_ARCH_LIST=8.6)
+          **Flash Attention 3:** disabled
+
+          ### Contents
+          - sgl-kernel (built from source, log: ${BUILD_LOG_SIZE})
+          - sglang-kt ${{ steps.version.outputs.version }}
+          - SM86 fallback patch (common_ops → sm90)
+
+          ### Docker
+          \`\`\`
+          docker pull ${{ env.REGISTRY }}/${{ github.repository }}:${{ steps.version.outputs.version }}
+          docker pull ${{ env.REGISTRY }}/${{ github.repository }}:latest
+          \`\`\`
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: sglang-kt ${{ steps.version.outputs.version }}
+          body_path: /tmp/release-notes.md
+          files: |
+            wheels/sgl_kernel-*.whl
+            sgl-kernel-build.log
+            memory-trace.log
+          fail_on_unmatched_files: false
