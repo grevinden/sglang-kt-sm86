@@ -188,12 +188,12 @@ jobs:
               CMAKE_BUILD_PARALLEL_LEVEL=1 \
               VERBOSE=1 \
               pip wheel \
-                -vvv \
-                --no-cache-dir \
-                --no-build-isolation \
-                --progress-bar on \
-                -d /workspace/wheels \
-                . 2>&1 | tee /workspace/sgl-kernel-build.log
+                              -vvv \
+                              --no-cache-dir \
+                              --no-build-isolation \
+                              --progress-bar on \
+                              --dest /workspace/wheels \
+                              . 2>&1 | tee /workspace/sgl-kernel-build.log
 
               PIP_EXIT_CODE=$?
               set -e
