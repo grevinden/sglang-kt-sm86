@@ -112,7 +112,7 @@ jobs:
               python3 --version
               pip --version
               python3 -c "import torch; print(f\"torch {torch.__version__}, CUDA {torch.version.cuda}\")"
-              python3 -c "import torch; print(f\"torch includes: sgl_kernel deps={hasattr(torch, \\\"ops\\\")}\")"
+              python3 -c "import torch; print(\"torch includes: sgl_kernel deps=\" + str(hasattr(torch, chr(111) + chr(112) + chr(115))))"
 
               echo ""
               echo "=============================================="
